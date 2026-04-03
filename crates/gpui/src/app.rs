@@ -2180,6 +2180,14 @@ impl App {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
     }
 
+    /// Gets the cursor offset of the currently active drag operation.
+    ///
+    /// Tera patch: this is the mouse position relative to the dragged element's origin
+    /// at the moment the drag started. Used for accurate drag positioning.
+    pub fn active_drag_cursor_offset(&self) -> Option<Point<Pixels>> {
+        self.active_drag.as_ref().map(|drag| drag.cursor_offset)
+    }
+
     /// Stops active drag and clears any related effects.
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
@@ -2535,6 +2543,11 @@ pub struct AnyDrag {
     /// This is used to render the dragged item in the same place
     /// on the original element that the drag was initiated
     pub cursor_offset: Point<Pixels>,
+
+    /// The current cursor position in global (screen) coordinates.
+    /// Updated on every mouse move so that any window can convert to its
+    /// own local coordinate space and render the drag ghost correctly.
+    pub cursor_screen_position: Point<Pixels>,
 
     /// The cursor style to use while dragging
     pub cursor_style: Option<CursorStyle>,

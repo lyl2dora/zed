@@ -560,8 +560,7 @@ pub enum WindowControlArea {
 pub struct HitboxId(u64);
 
 impl HitboxId {
-    /// Checks if the hitbox with this ID is currently hovered. Returns `false` during keyboard
-    /// input modality so that keyboard navigation suppresses hover highlights. Except when handling
+    /// Checks if the hitbox with this ID is currently hovered. Except when handling
     /// `ScrollWheelEvent`, this is typically what you want when determining whether to handle mouse
     /// events or paint hover styles.
     ///
@@ -570,9 +569,6 @@ impl HitboxId {
         // If this hitbox has captured the pointer, it's always considered hovered
         if window.captured_hitbox == Some(self) {
             return true;
-        }
-        if window.last_input_was_keyboard() {
-            return false;
         }
         let hit_test = &window.mouse_hit_test;
         for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
@@ -612,15 +608,13 @@ pub struct Hitbox {
 }
 
 impl Hitbox {
-    /// Checks if the hitbox is currently hovered. Returns `false` during keyboard input modality
-    /// so that keyboard navigation suppresses hover highlights. Except when handling
-    /// `ScrollWheelEvent`, this is typically what you want when determining whether to handle mouse
-    /// events or paint hover styles.
+    /// Checks if the hitbox is currently hovered. Except when handling `ScrollWheelEvent`, this is
+    /// typically what you want when determining whether to handle mouse events or paint hover
+    /// styles.
     ///
     /// This can return `false` even when the hitbox contains the mouse, if a hitbox in front of
     /// this sets `HitboxBehavior::BlockMouse` (`InteractiveElement::occlude`) or
-    /// `HitboxBehavior::BlockMouseExceptScroll` (`InteractiveElement::block_mouse_except_scroll`),
-    /// or if the current input modality is keyboard (see [`Window::last_input_was_keyboard`]).
+    /// `HitboxBehavior::BlockMouseExceptScroll` (`InteractiveElement::block_mouse_except_scroll`).
     ///
     /// Handling of `ScrollWheelEvent` should typically use `should_handle_scroll` instead.
     /// Concretely, this is due to use-cases like overlays that cause the elements under to be
@@ -2344,7 +2338,10 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
 
-        self.prepaint_deferred_draws(cx);
+        let mut sorted_deferred_draws =
+            (0..self.next_frame.deferred_draws.len()).collect::<SmallVec<[_; 8]>>();
+        sorted_deferred_draws.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
+        self.prepaint_deferred_draws(&sorted_deferred_draws, cx);
 
         let mut prompt_element = None;
         let mut active_drag_element = None;
@@ -2355,10 +2352,18 @@ impl Window {
             prompt_element = Some(element);
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
-            let mut element = active_drag.view.clone().into_any();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
-            element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
-            active_drag_element = Some(element);
+            // Only render the drag ghost in the window that contains the cursor.
+            // Without this guard every window would paint a ghost using its own
+            // (potentially stale) local mouse position.
+            let window_bounds = self.bounds();
+            if window_bounds.contains(&active_drag.cursor_screen_position) {
+                let local_mouse =
+                    active_drag.cursor_screen_position - window_bounds.origin;
+                let offset = local_mouse - active_drag.cursor_offset;
+                let mut element = active_drag.view.clone().into_any();
+                element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
+                active_drag_element = Some(element);
+            }
             cx.active_drag = Some(active_drag);
         } else {
             tooltip_element = self.prepaint_tooltip(cx);
@@ -2373,7 +2378,7 @@ impl Window {
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
 
-        self.paint_deferred_draws(cx);
+        self.paint_deferred_draws(&sorted_deferred_draws, cx);
 
         if let Some(mut prompt_element) = prompt_element {
             prompt_element.paint(self, cx);
@@ -2456,40 +2461,25 @@ impl Window {
         None
     }
 
-    fn prepaint_deferred_draws(&mut self, cx: &mut App) {
+    fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
 
-        let mut completed_draws = Vec::new();
+        let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
+        for deferred_draw_ix in deferred_draw_indices {
+            let deferred_draw = &mut deferred_draws[*deferred_draw_ix];
+            self.element_id_stack
+                .clone_from(&deferred_draw.element_id_stack);
+            self.text_style_stack
+                .clone_from(&deferred_draw.text_style_stack);
+            self.next_frame
+                .dispatch_tree
+                .set_active_node(deferred_draw.parent_node);
 
-        // Process deferred draws in multiple rounds to support nesting.
-        // Each round processes all current deferred draws, which may produce new ones.
-        let mut depth = 0;
-        loop {
-            // Limit maximum nesting depth to prevent infinite loops.
-            assert!(depth < 10, "Exceeded maximum (10) deferred depth");
-            depth += 1;
-            let deferred_count = self.next_frame.deferred_draws.len();
-            if deferred_count == 0 {
-                break;
-            }
-
-            // Sort by priority for this round
-            let traversal_order = self.deferred_draw_traversal_order();
-            let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
-
-            for deferred_draw_ix in traversal_order {
-                let deferred_draw = &mut deferred_draws[deferred_draw_ix];
-                self.element_id_stack
-                    .clone_from(&deferred_draw.element_id_stack);
-                self.text_style_stack
-                    .clone_from(&deferred_draw.text_style_stack);
-                self.next_frame
-                    .dispatch_tree
-                    .set_active_node(deferred_draw.parent_node);
-
-                let prepaint_start = self.prepaint_index();
-                if let Some(element) = deferred_draw.element.as_mut() {
-                    self.with_rendered_view(deferred_draw.current_view, |window| {
+            let prepaint_start = self.prepaint_index();
+            let content_mask = deferred_draw.content_mask.clone();
+            if let Some(element) = deferred_draw.element.as_mut() {
+                self.with_rendered_view(deferred_draw.current_view, |window| {
+                    window.with_content_mask(content_mask, |window| {
                         window.with_rem_size(Some(deferred_draw.rem_size), |window| {
                             window.with_absolute_element_offset(
                                 deferred_draw.absolute_offset,
@@ -2498,38 +2488,30 @@ impl Window {
                                 },
                             );
                         });
-                    })
-                } else {
-                    self.reuse_prepaint(deferred_draw.prepaint_range.clone());
-                }
-                let prepaint_end = self.prepaint_index();
-                deferred_draw.prepaint_range = prepaint_start..prepaint_end;
+                    });
+                })
+            } else {
+                self.reuse_prepaint(deferred_draw.prepaint_range.clone());
             }
-
-            // Save completed draws and continue with newly added ones
-            completed_draws.append(&mut deferred_draws);
-
-            self.element_id_stack.clear();
-            self.text_style_stack.clear();
+            let prepaint_end = self.prepaint_index();
+            deferred_draw.prepaint_range = prepaint_start..prepaint_end;
         }
-
-        // Restore all completed draws
-        self.next_frame.deferred_draws = completed_draws;
+        assert_eq!(
+            self.next_frame.deferred_draws.len(),
+            0,
+            "cannot call defer_draw during deferred drawing"
+        );
+        self.next_frame.deferred_draws = deferred_draws;
+        self.element_id_stack.clear();
+        self.text_style_stack.clear();
     }
 
-    fn paint_deferred_draws(&mut self, cx: &mut App) {
+    fn paint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
 
-        // Paint all deferred draws in priority order.
-        // Since prepaint has already processed nested deferreds, we just paint them all.
-        if self.next_frame.deferred_draws.len() == 0 {
-            return;
-        }
-
-        let traversal_order = self.deferred_draw_traversal_order();
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
-        for deferred_draw_ix in traversal_order {
-            let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
+        for deferred_draw_ix in deferred_draw_indices {
+            let mut deferred_draw = &mut deferred_draws[*deferred_draw_ix];
             self.element_id_stack
                 .clone_from(&deferred_draw.element_id_stack);
             self.next_frame
@@ -2554,13 +2536,6 @@ impl Window {
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
-    }
-
-    fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
-        let deferred_count = self.next_frame.deferred_draws.len();
-        let mut sorted_indices = (0..deferred_count).collect::<SmallVec<[_; 8]>>();
-        sorted_indices.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
-        sorted_indices
     }
 
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
@@ -4061,18 +4036,14 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
-        // Track input modality for focus-visible styling and hover suppression.
-        // Hover is suppressed during keyboard modality so that keyboard navigation
-        // doesn't show hover highlights on the item under the mouse cursor.
-        let old_modality = self.last_input_modality;
+        // Track whether this input was keyboard-based for focus-visible styling
         self.last_input_modality = match &event {
-            PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::KeyDown(_) | PlatformInput::ModifiersChanged(_) => {
+                InputModality::Keyboard
+            }
+            PlatformInput::MouseDown(e) if e.is_focusing() => InputModality::Mouse,
             _ => self.last_input_modality,
         };
-        if self.last_input_modality != old_modality {
-            self.refresh();
-        }
 
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
@@ -4130,6 +4101,7 @@ impl Window {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
                             cursor_offset: position,
+                            cursor_screen_position: self.bounds().origin + position,
                             cursor_style: None,
                         });
                     }
@@ -4222,9 +4194,31 @@ impl Window {
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
-                // If this was a mouse move event, redraw the window so that the
-                // active drag can follow the mouse cursor.
+                // Update the drag's screen-space cursor position so that any
+                // window (not just the one that owns SetCapture) can render the
+                // ghost at the correct location.
+                let screen_pos = self.bounds().origin + self.mouse_position();
+                if let Some(drag) = &mut cx.active_drag {
+                    drag.cursor_screen_position = screen_pos;
+                }
                 self.refresh();
+
+                // Refresh the window the cursor is actually over so it can
+                // paint the drag ghost.  On Windows, SetCapture keeps
+                // delivering WM_MOUSEMOVE to the source window even when the
+                // cursor is above a different window, so that other window
+                // would never refresh on its own.
+                let current_id = self.handle.window_id();
+                for handle in cx.windows() {
+                    if handle.window_id() == current_id {
+                        continue;
+                    }
+                    let _ = handle.update(cx, |_, win, _| {
+                        if win.bounds().contains(&screen_pos) {
+                            win.refresh();
+                        }
+                    });
+                }
             } else if event.is::<MouseUpEvent>() {
                 // If this was a mouse up event, cancel the active drag and redraw
                 // the window.

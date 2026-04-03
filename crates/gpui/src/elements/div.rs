@@ -290,6 +290,27 @@ impl Interactivity {
             }));
     }
 
+    /// Bind the given callback to the mouse move event, during the capture phase,
+    /// when the mouse is outside of the bounds of this element.
+    /// The imperative API equivalent to [`InteractiveElement::on_mouse_move_out`].
+    ///
+    /// Tera patch: upstream gpui has on_mouse_down_out and on_mouse_up_out but not
+    /// on_mouse_move_out. This is needed for Win32 SetCapture to deliver WM_MOUSEMOVE
+    /// outside window bounds during drag operations.
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn on_mouse_move_out(
+        &mut self,
+        listener: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.mouse_move_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && !hitbox.is_hovered(window) {
+                    (listener)(event, window, cx);
+                }
+            }));
+    }
+
     /// Bind the given callback to the mouse move event, during the bubble phase.
     /// The imperative API equivalent to [`InteractiveElement::on_mouse_move`].
     ///
@@ -912,6 +933,21 @@ pub trait InteractiveElement: Sized {
         listener: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity().on_mouse_up_out(button, listener);
+        self
+    }
+
+    /// Bind the given callback to the mouse move event, during the capture phase,
+    /// when the mouse is outside of the bounds of this element.
+    /// The fluent API equivalent to [`Interactivity::on_mouse_move_out`].
+    ///
+    /// Tera patch: see [`Interactivity::on_mouse_move_out`] for details.
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_mouse_move_out(
+        mut self,
+        listener: impl Fn(&MouseMoveEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_mouse_move_out(listener);
         self
     }
 
@@ -2449,6 +2485,8 @@ impl Interactivity {
                                 view: drag,
                                 value: drag_value,
                                 cursor_offset,
+                                cursor_screen_position: window.bounds().origin
+                                    + event.position,
                                 cursor_style: drag_cursor_style,
                             });
                             pending_mouse_down.take();
@@ -2589,8 +2627,7 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     let source_bounds = hitbox.bounds;
                     move |window: &Window| {
-                        !window.last_input_was_keyboard()
-                            && pending_mouse_down.borrow().is_none()
+                        pending_mouse_down.borrow().is_none()
                             && source_bounds.contains(&window.mouse_position())
                     }
                 });
