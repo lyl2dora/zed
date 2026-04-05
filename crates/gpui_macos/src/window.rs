@@ -264,6 +264,17 @@ unsafe fn build_classes() {
                     accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
                 );
 
+                // Prevent macOS from intercepting mouseDragged events in the
+                // titlebar area for native window dragging. gpui manages window
+                // movement itself via TitleBar's on_mouse_move → start_window_move().
+                // Without this override, NSView defaults to YES for non-opaque views,
+                // causing the window server to hijack drag gestures before gpui's
+                // on_drag mechanism can activate.
+                decl.add_method(
+                    sel!(mouseDownCanMoveWindow),
+                    mouse_down_can_move_window as extern "C" fn(&Object, Sel) -> BOOL,
+                );
+
                 decl.add_method(
                     sel!(characterIndexForPoint:),
                     character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
@@ -2456,6 +2467,10 @@ extern "C" fn accepts_first_mouse(this: &Object, _: Sel, _: id) -> BOOL {
     let mut lock = window_state.as_ref().lock();
     lock.first_mouse = true;
     YES
+}
+
+extern "C" fn mouse_down_can_move_window(_: &Object, _: Sel) -> BOOL {
+    NO
 }
 
 extern "C" fn character_index_for_point(this: &Object, _: Sel, position: NSPoint) -> u64 {
