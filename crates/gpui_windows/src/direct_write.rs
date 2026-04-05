@@ -780,7 +780,16 @@ impl DirectWriteState {
                 .GetGlyphIndices(&raw const codepoints, 1, &raw mut glyph_indices)
                 .log_err()
         }
-        .map(|_| GlyphId(glyph_indices as u32))
+        .and_then(|_| {
+            // Glyph index 0 is the .notdef glyph — the font does not contain
+            // this character.  Return None so callers (advance, CJK detection,
+            // etc.) correctly treat the character as missing.
+            if glyph_indices == 0 {
+                None
+            } else {
+                Some(GlyphId(glyph_indices as u32))
+            }
+        })
     }
 
     fn rasterize_glyph(
