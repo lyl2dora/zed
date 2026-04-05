@@ -795,7 +795,14 @@ impl MacWindow {
                 window.set_title(title);
             }
 
-            native_window.setMovable_(is_movable as BOOL);
+            // When the titlebar is transparent, gpui's TitleBar component
+            // handles window movement via performWindowDragWithEvent:, which
+            // works even with movable=NO. Disabling native movable prevents
+            // the window server from dragging the window in parallel with
+            // gpui's on_drag mechanism for elements in the titlebar area.
+            let movable = is_movable
+                && !titlebar.as_ref().is_none_or(|tb| tb.appears_transparent);
+            native_window.setMovable_(movable as BOOL);
 
             if let Some(window_min_size) = window_min_size {
                 native_window.setContentMinSize_(NSSize {

@@ -34,7 +34,7 @@ use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -2447,8 +2447,19 @@ impl Interactivity {
                     .get_or_insert_with(Default::default)
                     .clone();
 
+                // Track the screen-space position at mousedown time so that the
+                // drag threshold can be computed in screen coordinates. This is
+                // needed because macOS native titlebar drag moves the window in
+                // parallel with delivering mouseDragged events, keeping
+                // window-relative positions nearly constant.
+                let mouse_down_screen_pos = element_state
+                    .mouse_down_screen_pos
+                    .get_or_insert_with(Default::default)
+                    .clone();
+
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
+                    let mouse_down_screen_pos = mouse_down_screen_pos.clone();
                     let hitbox = hitbox.clone();
                     let has_aux_click_listeners = !aux_click_listeners.is_empty();
                     move |event: &MouseDownEvent, phase, window, _cx| {
@@ -2456,6 +2467,8 @@ impl Interactivity {
                             && (event.button == MouseButton::Left || has_aux_click_listeners)
                             && hitbox.is_hovered(window)
                         {
+                            mouse_down_screen_pos
+                                .set(Some(window.bounds().origin + event.position));
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
                             window.refresh();
                         }
@@ -2464,6 +2477,7 @@ impl Interactivity {
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
+                    let mouse_down_screen_pos = mouse_down_screen_pos.clone();
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
@@ -2473,7 +2487,14 @@ impl Interactivity {
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
-                            && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
+                            && {
+                                let screen_pos = window.bounds().origin + event.position;
+                                let window_mag = (event.position - mouse_down.position).magnitude();
+                                let screen_mag = mouse_down_screen_pos.get()
+                                    .map(|down| (screen_pos - down).magnitude())
+                                    .unwrap_or(window_mag);
+                                window_mag > DRAG_THRESHOLD || screen_mag > DRAG_THRESHOLD
+                            }
                             && let Some((drag_value, drag_listener)) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
                         {
@@ -2940,6 +2961,7 @@ pub struct InteractiveElementState {
     pub(crate) hover_state: Option<Rc<RefCell<ElementHoverState>>>,
     pub(crate) hover_listener_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
+    pub(crate) mouse_down_screen_pos: Option<Rc<Cell<Option<Point<Pixels>>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
