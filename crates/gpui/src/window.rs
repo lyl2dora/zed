@@ -4680,6 +4680,15 @@ impl Window {
         });
     }
 
+    /// Synchronously update the IME candidate window position.
+    ///
+    /// Unlike [`invalidate_character_coordinates`] which defers to the next frame,
+    /// this pushes the position immediately. Useful when the caller already has
+    /// the freshly computed cursor bounds (e.g. during prepaint).
+    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        self.platform_window.update_ime_position(bounds);
+    }
+
     /// Present a platform dialog.
     /// The provided message will be presented, along with buttons for each answer.
     /// When a button is clicked, the returned Receiver will receive the index of the clicked button.
